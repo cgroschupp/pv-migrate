@@ -2,6 +2,11 @@ package main
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	cryptorand "crypto/rand"
+	"crypto/x509"
+	"encoding/pem"
 	"flag"
 	"fmt"
 	"math/rand"
@@ -11,6 +16,7 @@ import (
 	"time"
 
 	log "github.com/sirupsen/logrus"
+	"golang.org/x/crypto/ssh"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -62,6 +68,10 @@ func doCleanup(kubeClient *kubernetes.Clientset, instance string, namespace stri
 	})
 
 	_ = kubeClient.CoreV1().Pods(namespace).DeleteCollection(context.TODO(), metav1.DeleteOptions{}, metav1.ListOptions{
+		LabelSelector: "app=pv-migrate,instance=" + instance,
+	})
+
+	_ = kubeClient.CoreV1().Secrets(namespace).DeleteCollection(context.TODO(), metav1.DeleteOptions{}, metav1.ListOptions{
 		LabelSelector: "app=pv-migrate,instance=" + instance,
 	})
 
@@ -150,7 +160,10 @@ func main() {
 	defer doCleanup(sourceKubeClient, instance, *sourceNamespace)
 	defer doCleanup(destKubeClient, instance, *destNamespace)
 
-	migrateViaRsync(instance, sourceKubeClient, destKubeClient, sourceClaimInfo, destClaimInfo)
+	err = migrateViaRsync(instance, sourceKubeClient, destKubeClient, sourceClaimInfo, destClaimInfo)
+	if err != nil {
+		log.WithError(err).Fatal("unable to run migrate")
+	}
 }
 
 func handleSigterm(sourceKubeClient, destKubeClient *kubernetes.Clientset, instance string, sourceNamespace string, destNamespace string) {
@@ -170,8 +183,6 @@ func buildRsyncCommand(claimInfo claimInfo, targetHost string) []string {
 		rsyncCommand = append(rsyncCommand, "--delete")
 	}
 	rsyncCommand = append(rsyncCommand, "-avz")
-	rsyncCommand = append(rsyncCommand, "-e")
-	rsyncCommand = append(rsyncCommand, "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null")
 	rsyncCommand = append(rsyncCommand, fmt.Sprintf("root@%s:/source/", targetHost))
 	rsyncCommand = append(rsyncCommand, "/dest/")
 
@@ -182,6 +193,10 @@ func prepareRsyncJob(instance string, destClaimInfo claimInfo, targetHost string
 	jobTtlSeconds := int32(600)
 	backoffLimit := int32(0)
 	jobName := "pv-migrate-rsync-" + instance
+
+	var secureFileMode, normalFileMode int32
+	secureFileMode = 0600
+	normalFileMode = 0600
 
 	job := batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
@@ -213,6 +228,19 @@ func prepareRsyncJob(instance string, destClaimInfo claimInfo, targetHost string
 								},
 							},
 						},
+						{
+							Name: "ssh-keys",
+							VolumeSource: corev1.VolumeSource{
+								Secret: &corev1.SecretVolumeSource{
+									SecretName: "pv-migrate-" + instance,
+									Items: []corev1.KeyToPath{
+										{Key: "user-key", Mode: &secureFileMode, Path: "user-key"},
+										{Key: "user-pub", Mode: &secureFileMode, Path: "user-pub"},
+										{Key: "host-pub", Mode: &normalFileMode, Path: "host-pub"},
+										{Key: "host-key", Mode: &secureFileMode, Path: "host-key"},
+									},
+								}},
+						},
 					},
 					Containers: []corev1.Container{
 						{
@@ -226,6 +254,18 @@ func prepareRsyncJob(instance string, destClaimInfo claimInfo, targetHost string
 									MountPath: "/dest",
 									ReadOnly:  destClaimInfo.readOnly,
 								},
+								{
+									Name:      "ssh-keys",
+									MountPath: "/root/.ssh/id_ecdsa",
+									SubPath:   "user-key",
+									ReadOnly:  true,
+								},
+								{
+									Name:      "ssh-keys",
+									MountPath: "/root/.ssh/known_hosts",
+									SubPath:   "host-pub",
+									ReadOnly:  true,
+								},
 							},
 						},
 					},
@@ -238,19 +278,93 @@ func prepareRsyncJob(instance string, destClaimInfo claimInfo, targetHost string
 	return job
 }
 
-func migrateViaRsync(instance string, sourcekubeClient *kubernetes.Clientset, destkubeClient *kubernetes.Clientset, sourceClaimInfo claimInfo, destClaimInfo claimInfo) {
-	sftpPod := prepareSshdPod(instance, sourceClaimInfo)
-	createSshdPodWaitTillRunning(sourcekubeClient, sftpPod)
+func generateSecretData(targetServiceAddress string) (map[string]string, error) {
+	secretData := make(map[string]string, 0)
+	hostKey, hostPub, err := generateSSHKeyPair()
+	if err != nil {
+		return nil, err
+	}
+	userKey, userPub, err := generateSSHKeyPair()
+	if err != nil {
+		return nil, err
+	}
+	secretData["host-key"] = hostKey
+	secretData["host-pub"] = targetServiceAddress + " " + hostPub
+	secretData["user-key"] = userKey
+	secretData["user-pub"] = userPub
+
+	return secretData, nil
+}
+
+func migrateViaRsync(instance string, sourcekubeClient *kubernetes.Clientset, destkubeClient *kubernetes.Clientset, sourceClaimInfo claimInfo, destClaimInfo claimInfo) error {
 	createdService := createSshdService(instance, sourcekubeClient, sourceClaimInfo)
 	targetServiceAddress := getServiceAddress(createdService, sourcekubeClient)
-
 	log.Infof("use service address %s to connect to rsync server", targetServiceAddress)
+
+	secretData, err := generateSecretData(targetServiceAddress)
+	if err != nil {
+		return err
+	}
+
+	createSshdSecret(prepareSshSecret(instance, sourceClaimInfo, secretData), sourcekubeClient, sourceClaimInfo)
+	// TODO and context
+	if sourceClaimInfo.claim.Namespace != destClaimInfo.claim.Namespace || {
+		createSshdSecret(prepareSshSecret(instance, destClaimInfo, secretData), destkubeClient, destClaimInfo)
+	}
+
+	sftpPod := prepareSshdPod(instance, sourceClaimInfo)
+	createSshdPodWaitTillRunning(sourcekubeClient, sftpPod)
+
 	rsyncJob := prepareRsyncJob(instance, destClaimInfo, targetServiceAddress)
 	createJobWaitTillCompleted(destkubeClient, rsyncJob)
+	return nil
+}
+
+func generateSSHKeyPair() (string, string, error) {
+	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), cryptorand.Reader)
+	if err != nil {
+		return "", "", err
+	}
+
+	data, err := x509.MarshalECPrivateKey(privateKey)
+	if err != nil {
+		return "", "", err
+	}
+
+	privateKeyPEM := &pem.Block{Type: "EC PRIVATE KEY", Bytes: data}
+
+	pub, err := ssh.NewPublicKey(&privateKey.PublicKey)
+	if err != nil {
+		return "", "", err
+	}
+
+	return string(pem.EncodeToMemory(privateKeyPEM)), string(ssh.MarshalAuthorizedKey(pub)), nil
+}
+
+func prepareSshSecret(instance string, cInfo claimInfo, secretData map[string]string) corev1.Secret {
+	secretName := "pv-migrate-" + instance
+
+	return corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      secretName,
+			Namespace: cInfo.claim.Namespace,
+			Labels: map[string]string{
+				"app":       "pv-migrate",
+				"component": "sshd",
+				"instance":  instance,
+			},
+		},
+		StringData: secretData,
+	}
 }
 
 func prepareSshdPod(instance string, sourceClaimInfo claimInfo) corev1.Pod {
 	podName := "pv-migrate-sshd-" + instance
+
+	var secureFileMode, normalFileMode int32
+	secureFileMode = 0600
+	normalFileMode = 0600
+
 	return corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      podName,
@@ -272,17 +386,43 @@ func prepareSshdPod(instance string, sourceClaimInfo claimInfo) corev1.Pod {
 						},
 					},
 				},
+				{
+					Name: "ssh-keys",
+					VolumeSource: corev1.VolumeSource{
+						Secret: &corev1.SecretVolumeSource{
+							SecretName: "pv-migrate-" + instance,
+							Items: []corev1.KeyToPath{
+								{Key: "user-key", Mode: &secureFileMode, Path: "user-key"},
+								{Key: "user-pub", Mode: &secureFileMode, Path: "user-pub"},
+								{Key: "host-pub", Mode: &normalFileMode, Path: "host-pub"},
+								{Key: "host-key", Mode: &secureFileMode, Path: "host-key"},
+							},
+						}},
+				},
 			},
 			Containers: []corev1.Container{
 				{
 					Name:            "app",
 					Image:           "docker.io/utkuozdemir/pv-migrate-sshd:v0.1.0",
 					ImagePullPolicy: corev1.PullAlways,
+					// Args:            []string{"-o", "LogLevel=DEBUG"},
 					VolumeMounts: []corev1.VolumeMount{
 						{
 							Name:      "source-vol",
 							MountPath: "/source",
 							ReadOnly:  sourceClaimInfo.readOnly,
+						},
+						{
+							Name:      "ssh-keys",
+							MountPath: "/etc/ssh/ssh_host_ecdsa_key",
+							SubPath:   "host-key",
+							ReadOnly:  true,
+						},
+						{
+							Name:      "ssh-keys",
+							MountPath: "/root/.ssh/authorized_keys",
+							SubPath:   "user-pub",
+							ReadOnly:  true,
 						},
 					},
 					Ports: []corev1.ContainerPort{
@@ -376,6 +516,20 @@ func createSshdService(instance string, kubeClient *kubernetes.Clientset, source
 	return createdService
 }
 
+func createSshdSecret(secret corev1.Secret, kubeClient *kubernetes.Clientset, cInfo claimInfo) {
+	log.WithFields(log.Fields{
+		"secretName": secret.Name,
+	}).Info("Creating sshd secret")
+	_, err := kubeClient.CoreV1().Secrets(cInfo.claim.Namespace).Create(
+		context.TODO(),
+		&secret,
+		v1.CreateOptions{},
+	)
+	if err != nil {
+		log.WithError(err).Fatal("secret creation failed")
+	}
+}
+
 func createSshdPodWaitTillRunning(kubeClient *kubernetes.Clientset, pod corev1.Pod) *corev1.Pod {
 	running := make(chan bool)
 	defer close(running)
@@ -410,9 +564,9 @@ func createSshdPodWaitTillRunning(kubeClient *kubernetes.Clientset, pod corev1.P
 	}).Info("Creating sshd pod")
 	createdPod, err := kubeClient.CoreV1().Pods(pod.Namespace).Create(context.TODO(), &pod, metav1.CreateOptions{})
 	if err != nil {
-		log.WithFields(log.Fields{
+		log.WithError(err).WithFields(log.Fields{
 			"podName": pod.Name,
-		}).Panic("Failed to create sshd pod")
+		}).Fatal("Failed to create sshd pod")
 	}
 
 	log.WithFields(log.Fields{
