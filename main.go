@@ -301,7 +301,7 @@ func buildClaimInfo(kubeClient *kubernetes.Clientset, sourceNamespace *string, s
 	}
 	ownerNode, err := findOwnerNodeForPvc(kubeClient, claim)
 	if err != nil {
-		log.Fatal("Could not determine the owner of the source claim")
+		log.WithError(err).Fatal("Could not determine the owner of the source claim")
 	}
 	return claimInfo{
 		ownerNode:             ownerNode,
@@ -329,7 +329,7 @@ func getServiceAddress(svc *corev1.Service, kubeClient *kubernetes.Clientset, ma
 
 		createdService, err := kubeClient.CoreV1().Services(svc.Namespace).Get(context.TODO(), svc.Name, v1.GetOptions{})
 		if err != nil {
-			log.Fatal("unable to get service")
+			log.WithError(err).Fatal("unable to get service")
 		}
 
 		if len(createdService.Status.LoadBalancer.Ingress) == 0 {
@@ -399,7 +399,7 @@ func createSshdPodWaitTillRunning(kubeClient *kubernetes.Clientset, pod corev1.P
 					case corev1.PodFailed, corev1.PodUnknown:
 						log.WithFields(log.Fields{
 							"podName": newPod.Name,
-						}).Panic("sshd pod failed to start, exiting")
+						}).Fatal("sshd pod failed to start, exiting")
 					}
 				}
 			},
@@ -414,7 +414,7 @@ func createSshdPodWaitTillRunning(kubeClient *kubernetes.Clientset, pod corev1.P
 	if err != nil {
 		log.WithFields(log.Fields{
 			"podName": pod.Name,
-		}).Panic("Failed to create sshd pod")
+		}).WithError(err).Fatal("Failed to create sshd pod")
 	}
 
 	log.WithFields(log.Fields{
@@ -452,7 +452,7 @@ func createJobWaitTillCompleted(kubeClient *kubernetes.Clientset, job batchv1.Jo
 						log.WithFields(log.Fields{
 							"jobName": job.Name,
 							"podName": newPod.Name,
-						}).Panic("Job failed, exiting")
+						}).Fatalf("Job failed, unknown phase %s, exiting", newPod.Status.Phase)
 					}
 				}
 			},
