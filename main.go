@@ -4,7 +4,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"math/rand"
 	"os"
 	"os/signal"
 	"syscall"
@@ -16,6 +15,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/util/rand"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -26,22 +26,6 @@ import (
 	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
 	_ "k8s.io/client-go/plugin/pkg/client/auth/oidc"
 )
-
-func init() {
-	log.SetOutput(os.Stdout)
-	log.SetLevel(log.DebugLevel)
-	rand.Seed(time.Now().UnixNano())
-}
-
-var letters = []rune("abcdefghijklmnopqrstuvwxyz0123456789")
-
-func randSeq(n int) string {
-	b := make([]rune, n)
-	for i := range b {
-		b[i] = letters[rand.Intn(len(letters))]
-	}
-	return string(b)
-}
 
 type claimInfo struct {
 	ownerNode             string
@@ -143,7 +127,7 @@ func main() {
 	destClaimInfo := buildClaimInfo(destKubeClient, destNamespace, dest, false, *deleteExtraneousFromDest, svcType)
 
 	log.Info("Both claims exist and bound, proceeding...")
-	instance := randSeq(5)
+	instance := rand.String(5)
 
 	handleSigterm(sourceKubeClient, destKubeClient, instance, *sourceNamespace, *destNamespace)
 
