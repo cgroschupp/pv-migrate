@@ -150,7 +150,7 @@ func main() {
 	defer doCleanup(sourceKubeClient, instance, *sourceNamespace)
 	defer doCleanup(destKubeClient, instance, *destNamespace)
 
-	err = migrateViaRsync(instance, sourceKubeClient, destKubeClient, sourceClaimInfo, destClaimInfo, maxRetriesFetchServiceIP)
+	err = migrateViaRsync(instance, sourceKubeClient, destKubeClient, sourceClaimInfo, destClaimInfo, *maxRetriesFetchServiceIP)
 
 	if err != nil {
 		log.WithError(err).Fatal("pv migrate unsuccessful")
@@ -255,6 +255,8 @@ func migrateViaRsync(instance string, sourcekubeClient *kubernetes.Clientset, de
 	log.Infof("use service address %s to connect to rsync server", targetServiceAddress)
 	rsyncJob := prepareRsyncJob(instance, destClaimInfo, targetServiceAddress)
 	createJobWaitTillCompleted(destkubeClient, rsyncJob)
+
+	return nil
 }
 
 func prepareSshdPod(instance string, sourceClaimInfo claimInfo) corev1.Pod {
